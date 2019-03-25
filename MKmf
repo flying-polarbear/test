@@ -1,0 +1,546 @@
+#!/usr/bin/env python3
+
+# The program creates Makeflow and shell script, make it ready to run.
+# It also collects QC matrices after full run.
+
+import os
+import sys
+import re
+import argparse
+from argparse import RawTextHelpFormatter
+import yaml
+import pandas
+import json
+import math
+import glob
+import collections
+from collections import defaultdict
+from Mfunc import MutFunc as pf
+
+
+version='1.0 alpha'
+
+dir1='1_unmapped'
+dir2='2_sort'
+dir3='3_dedup'
+dir4='4_realign'
+dir5='5_recal'
+dira='annotate'
+dirc='cnv'
+dirf='fusion'
+dirs='snv_indel'
+dirt='tmb'
+dirm='msi'
+
+
+def main():
+  sample_help='''Input sample config file with tsv format of 5 fields:
+  Uni_sName = Unique (no duplication) sample name
+  n_libName = Library name of normal sample (should be part of FASTQ file name)
+  t_libName = Library name of tumor sample (should be part of FASTQ file name)
+  panel     = Panel name. Available values: panel519(b), panel82, colorect, gyno, panelblood*
+  sex       = Sex/Gender of the patient. Available values: f (female), m (male)'''
+  analy_help='''The analyses to be done:
+  1 = Clean FASTQ files
+  2 = Quality control FASTQ files (fastqc)
+  3 = Mapping (by bwa mem)
+  4 = Sort bam files
+  5 = Mark duplicates in bam files
+  6 = Run IndelRealigner for bam files
+  7 = Run BQSR for bam files
+  8 = Run Mutect2 to get VCF/variants
+  9 = Annotate VCF files
+  a = Evaluate cross-individual contamination
+  b = Mapping by bwa aln
+  c = Copy number variant calling
+  f = Clean FASTQ files (fastp/OpenGene)
+  g = Dedup (OpenGene)
+  h = Run mpileup
+  i = Run varscan
+  j = Annotate VCF files (varscan output)
+  k = Run MrBam (OpenGene)
+  l = Run MutScan (OpenGene)
+  m = Run GeneFuse (OpenGene)
+  q = Get QC matrices
+  t = Tumor Mutation Burden (old TMB analysis)
+  y = Delete less big files
+  z = Delete big files
+  A = Convert FASTQ to unmapped BAM (GATK4)
+  B = Run BWA-MEM to get mapped BAM (GATK4)
+  C = Run BWA-ALN to get mapped BAM (GATK4)
+  D = Merge unmapped and mapped BAM (GATK4)
+  E = Germline pipeline (GATK4)
+  F = Fusion detection pipeline (Factera)
+  G = CNV detection pipeline (CONTRA)
+  H = TMB analysis pipeline
+  I = MSI analysis pipeline (MANTIS)
+  J = QC analysis pipeline
+
+Recommended analyses:
+  ABCDEFGHIJ5789 = Standard tumor-normal analysis (SNP/INDEL/CNV/Fusion/Germline/TMB/MSI/QC)
+  ABCDEJ789 = BRAC tumor-normal analysis (panel: panelbrca, multiplex PCR, no dedup/CNV/Fusion/TMB/MSI)
+  ABDHJ5789 = Tumor only analysis (n_libName: NA, panel: panelblood[12])
+  ABDEJ579 = Normal only analysis (t_libName: NA, panel: gyno, 'J' added on 15/11/2018)
+  ACDF = Fusion only analysis
+  ABDG57 = CNV only analysis
+  ABDH5789 = TMB only analysis
+  ABDI57 = MSI only analysis\n'''
+  parser = argparse.ArgumentParser(description='Variation detection and annotation pipeline [%s, GeneSmile]' % version, formatter_class=RawTextHelpFormatter)
+  parser.add_argument('-i',required=True,dest='fqs',help='Directory with FASTQ files. The program will search the folder recursively. All FASTQ files are in any level of this folder and have format of *_R?[12].fa?s?t?q.gz (eg. normal_1.fq.gz, cancer_R2.fastq.gz) (REQUIRED)')
+  group = parser.add_mutually_exclusive_group(required=True)
+  group.add_argument('-c',dest='cfg',help=sample_help)
+  group.add_argument('-t',dest='lst',help='Input sample list file (one sample per line)')
+  parser.add_argument('-l',dest='nolink',action='store_true',help='When searching FASTQ files, do not search links if set')
+  parser.add_argument('-q',dest='qcstat',action='store_true',help='Run QC stat after a former full run, if set')
+  parser.add_argument('-e',dest='test',action='store_true',help='Run test (no QC warns), if set')
+  parser.add_argument('-d',required=False,dest='rtdir',help='Root Output result directory, default [.]',default='.')
+  parser.add_argument('-y',required=False,dest='path',help='The YAML file with the paths of programs and data, default [config.yml]', default="%s/%s" % (os.path.dirname(os.path.abspath(__file__)),'config.yml'))
+  parser.add_argument('-n',required=False,dest='nsp',help='Maximal number of samples running together, default [1]', default=1)
+  parser.add_argument('-b',required=False,dest='nsb',help='The number of Mutect2 threads, should be 1, 4 or 12, default [1]', default=1)
+  parser.add_argument('-p',required=False,dest='np',help='The number of threads for mapping, default [2]', default=2)
+  #parser.add_argument('-u',required=False,dest='nin',help='The number of inpUts for each sample, default [2] (normal+tumor)', default=2)
+  parser.add_argument('-m',required=False,dest='mf',help='The output makeflow filename with commands, default [mf]', default='mf')
+  parser.add_argument('-s',required=False,dest='sh',help='The output shell script filename, default [run.sh]', default='run.sh')
+  parser.add_argument('-o',required=False,dest='cosm',help='The version of CoSMIC database, default [87]', default='87')
+  parser.add_argument('-a',required=False,dest='analy',help=analy_help, default='ABCDEFGHIJ5789')
+
+  if len(sys.argv) <= 1:
+    parser.print_help()
+    sys.exit(1)
+  args = parser.parse_args()
+
+  yaml_f=os.path.abspath(args.path)
+  config = os.path.abspath(args.cfg) if args.cfg else ''
+  samplist = os.path.abspath(args.lst) if args.lst else ''
+  rtdir = os.path.abspath(args.rtdir)
+  fqdir = os.path.abspath(args.fqs)
+  maxsamp = int(args.nsp)
+  np = int(args.np)
+  #nin = int(args.nin)
+
+  if not os.path.isfile(yaml_f):
+    print("Error: File '%s' does not exist!" % yaml_f, file=sys.stderr)
+    sys.exit(1)
+
+  with open(yaml_f, 'r') as ymlfile:
+    yml_cfg = yaml.load(ymlfile)
+
+  for v in yml_cfg.values():
+    if isinstance(v,dict):
+      for v2 in v.values():
+        verifyDF(v2)
+    else:
+      verifyDF(v)
+
+  #fqs_list = os.listdir(path=fqdir)
+  fqs_list=glob.glob(fqdir+'/**/*.gz', recursive=True)
+  fqs_list=[x for x in fqs_list if not os.path.islink(x)] if args.nolink else fqs_list
+
+  sampleInfo_dict = defaultdict(dict)
+
+  # Get sample information
+  if args.cfg:
+    inConfig_tsv_dt = pandas.read_table(config,sep='\s+',header=0,lineterminator='\n',skip_blank_lines=True)
+    if True in inConfig_tsv_dt.duplicated(subset='Uni_sName',keep=False).get_values():
+      print("Error: Duplicated field 'Uni_sName' exists in file '%s'." % config, file=sys.stderr)
+      sys.exit(1)
+    for i in inConfig_tsv_dt.index:
+      uName,nFqName,tFqName,panel,sex = inConfig_tsv_dt.loc[i,['Uni_sName','n_libName','t_libName','panel','sex']]
+      print("(%d)  %s  %s  %s  %s  %s" % (i,uName,nFqName,tFqName,panel,sex))
+      sampleInfo_dict[uName]['sex']=sex
+      if panel=='panelbrca':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bedbrca']
+      elif panel=='panelbrca161':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bedbrca161']
+      elif panel=='panelblood1':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bedblood1']
+      elif panel=='panelblood199':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bedblood199']
+      elif panel=='panelblood2':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bedblood2']
+      elif panel=='panelblood195':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bedblood195']
+      elif panel=='panelblood200':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bedblood200']
+      elif panel=='panelblood196':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bedblood196']
+      elif panel=='panelblood197':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bedblood197']
+      elif panel=='panelblood198':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bedblood198']
+      elif panel=='panel519b':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bed519b']
+      elif panel=='panel519':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bed519']
+      elif panel=='panel82':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bed82']
+      elif panel=='gyno':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bedgyno']
+      elif panel=='colorect':
+        sampleInfo_dict[uName]['panel']=yml_cfg['sample-details']['bedcolorect']
+      else:
+        print("Error: Unknown panel '%s'." % panel, file=sys.stderr)
+        sys.exit(1)
+      if (is_number(nFqName) and not math.isnan(nFqName)) or (not is_number(nFqName)):
+        sampleInfo_dict[uName]['normal'] = [ os.path.join(fqdir,x)
+                          for i in ['R?1.fa?s?t?q.gz','R?2.fa?s?t?q.gz']
+                          for x in fqs_list
+                          if re.findall(re.compile(r'''.*%s.*%s''' % (nFqName,i),re.VERBOSE),x)
+        ]
+        print(sampleInfo_dict[uName]['normal'])
+        if sampleInfo_dict[uName]['normal'].__len__() != 2:
+          print('Error: Please check if the number of normal FASTQ files of sample "%s" is not 2.' % uName, file=sys.stderr)
+          print(sampleInfo_dict[uName]['normal'])
+          sys.exit(1)
+      else:
+        sampleInfo_dict[uName]['normal'] = None
+      if (is_number(tFqName) and not math.isnan(tFqName)) or (not is_number(tFqName)):
+        sampleInfo_dict[uName]['tumor'] = [ os.path.join(fqdir,x)
+                        for i in ['R?1.fa?s?t?q.gz','R?2.fa?s?t?q.gz']
+                        for x in fqs_list
+                        if re.findall(re.compile(r'''.*%s.*%s''' % (tFqName,i),re.VERBOSE),x)
+        ]
+        print(sampleInfo_dict[uName]['tumor'])
+        if sampleInfo_dict[uName]['tumor'].__len__() != 2:
+          print("Error: Please check if the number of tumor FASTQ files of sample \"%s\" is not 2." % uName, file=sys.stderr)
+          print(sampleInfo_dict[uName]['tumor'])
+          sys.exit(1)
+      else:
+        sampleInfo_dict[uName]['tumor'] = None
+
+  if args.lst:
+    with open(samplist, 'r') as f:
+      splst = f.readlines()
+    splst=list(map(lambda x:x.strip(),splst)) # chomp CR
+    dup=[x for x, count in collections.Counter(splst).items() if count > 1]
+    if dup:
+      print("Error: Duplicated sample names in file '%s'." % samplist, file=sys.stderr)
+      sys.exit(1)
+    for uName in splst:
+      #nFqName=uName+'W'
+      #print("%s\t%s" % (uName,nFqName))
+      print("%s" % uName)
+      sampleInfo_dict[uName]['panel'] = yml_cfg['sample-details']['bed519']
+      sampleInfo_dict[uName]['normal'] = [ os.path.join(fqdir,x)
+                        for i in ['R?1.fa?s?t?q.gz','R?2.fa?s?t?q.gz']
+                        for x in fqs_list
+                        if re.findall(re.compile(r'''.*%s.*W.*%s''' % (uName,i),re.VERBOSE),x)
+                        #if re.findall(re.compile(r'''.*%s_.*%s''' % (nFqName,i),re.VERBOSE),x)
+      ]
+      if not sampleInfo_dict[uName]['normal']:
+        print("Normal sample could not be found.", file=sys.stderr)
+        sys.exit(1)
+      print(sampleInfo_dict[uName]['normal'])
+      #tFqName=uName+'C'
+      sampleInfo_dict[uName]['tumor'] = [ os.path.join(fqdir,x)
+                        for i in ['R?1.fa?s?t?q.gz','R?2.fa?s?t?q.gz']
+                        for x in fqs_list
+                        if re.findall(re.compile(r'''.*%s.*C.*%s''' % (uName,i),re.VERBOSE),x)
+                        #if re.findall(re.compile(r'''.*%s_.*%s''' % (tFqName,i),re.VERBOSE),x)
+      ]
+      if not sampleInfo_dict[uName]['tumor']:
+        #tFqName=uName+'F'
+        sampleInfo_dict[uName]['tumor'] = [ os.path.join(fqdir,x)
+                          for i in ['R?1.fa?s?t?q.gz','R?2.fa?s?t?q.gz']
+                          for x in fqs_list
+                          if re.findall(re.compile(r'''.*%s.*F.*%s''' % (uName,i),re.VERBOSE),x)
+        ]
+        if not sampleInfo_dict[uName]['tumor']:
+          #tFqName=uName+'T'
+          sampleInfo_dict[uName]['tumor'] = [ os.path.join(fqdir,x)
+                            for i in ['R?1.fa?s?t?q.gz','R?2.fa?s?t?q.gz']
+                            for x in fqs_list
+                            if re.findall(re.compile(r'''.*%s.*T.*%s''' % (uName,i),re.VERBOSE),x)
+          ]
+          if not sampleInfo_dict[uName]['tumor']:
+            print("Tumor sample could not be found.", file=sys.stderr)
+            sys.exit(1)
+      print(sampleInfo_dict[uName]['tumor'])
+      if sampleInfo_dict[uName]['normal'].__len__() != 2 or sampleInfo_dict[uName]['tumor'].__len__() != 2:
+        print("Error: Please check if the number of FASTQ files of sample \"%s\" is not 2." % uName, file=sys.stderr)
+        sys.exit(1)
+
+  #print(json.dumps(sampleInfo_dict,indent=2))
+
+  tnPath=[os.path.join(s,t) for s in ['tumor','normal'] for t in [dir1,dir2,dir3,dir4,dir5]]
+  smPath=[os.path.join(s,t) for s in ['somatic','germline'] for t in [dira,dirc,dirf,dirs,dirt,dirm]]
+  mainsh=open(os.path.join(rtdir,args.sh),'w') if not args.qcstat else ''
+  ngrp=math.ceil(sampleInfo_dict.__len__()/maxsamp)
+  for i in range(0,ngrp):
+    outdir = rtdir if ngrp==1 else os.path.join(rtdir,str(i))
+    assert not os.makedirs(os.path.join(outdir,'result'),exist_ok=True) ,"Cannot create %s" % os.path.join(outdir,'result')
+    mfile=os.path.join(outdir,args.mf)
+
+    mkflow=open(mfile,'w')
+    if args.qcstat:
+      for sp in sorted(sampleInfo_dict.keys())[i*maxsamp:(i+1)*maxsamp]:
+        spdir = os.path.join(outdir,'result',sp)
+        pf.QCstat(sampleInfo_dict[sp]['normal'],sampleInfo_dict[sp]['tumor'],mf=mkflow,outdir=spdir,name=sp)
+      continue
+
+    sps=[]
+    for sp in sorted(sampleInfo_dict.keys())[i*maxsamp:(i+1)*maxsamp]:
+      sps.append(sp)
+
+    mainsh.write("\n") if i!=0 else ''
+    mainsh.write("dt=`date`\n")
+    mainsh.write("echo --- $dt %s\n" % outdir)
+    mainsh.write("cd %s\n" % outdir)
+    mainsh.write("makeflow -r 3 %s &>eo\n" % mfile)
+    mainsh.write("%s 1 &>>eo\n" % yml_cfg['softwares']['report'])
+    if not args.test:
+      mainsh.write("ruby %s %s %s &>>eo\n" % (yml_cfg['softwares']['emaildone'],'_'.join(sps),outdir))
+
+    mkflow.write("# NGS analysis pipeline\n\n")
+    #mkflow.write(".MAKEFLOW CORES 14\n")
+    if '1' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY FastqClean\n")
+    if '2' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY FqQualControl\n")
+    if '3' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY BWA-MEM\n")
+    if '4' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY bam2sortBamAndIndex\n")
+    if '5' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY markDuplicates\n")
+    if '6' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY IndelRealigner\n")
+    if '7' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY BQSR\n")
+    if '8' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY Mutect2\n")
+      mkflow.write(".MAKEFLOW CATEGORY Mutect2_Filter\n")
+    if '9' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY Annotation\n")
+    if "a" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY tumorNormalContEst\n")
+    if "b" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY BWA-ALN\n")
+    if "c" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY callCNV\n")
+    if "f" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY FastqCleanP\n")
+    if "g" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY DedupOpengene\n")
+    if "h" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY mpileup\n")
+    if "i" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY varscan\n")
+    if "j" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY AnnotationVarscanVCF\n")
+    if "k" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY MrBam\n")
+    if "l" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY Mutscan\n")
+    if "m" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY Genefuse\n")
+    if "q" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY QCrun\n")
+    if "t" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY TumorMutationBurden\n")
+    if "y" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY DeleteBigFilesLess\n")
+    if "z" in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY DeleteBigFiles\n")
+    if 'A' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY FQ2Bam\n")
+    if 'B' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY BWA_MEM\n")
+    if 'C' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY BWA_ALN\n")
+    if 'D' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY MergeBam\n")
+    if 'E' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY Germline\n")
+    if 'F' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY FusionFactera\n")
+    if 'G' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY CNV_CONTRA\n")
+    if 'H' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY TMB\n")
+    if 'I' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY MSI\n")
+    if 'J' in args.analy:
+      mkflow.write(".MAKEFLOW CATEGORY QualControl\n")
+
+    for sp in sorted(sampleInfo_dict.keys())[i*maxsamp:(i+1)*maxsamp]:
+      assert not os.makedirs(os.path.join(outdir,'result',sp,'qc'),exist_ok=True),"Cannot create %s" % os.path.join(outdir,'result',sp,'qc')
+      for sm in smPath:
+        assert not os.makedirs(os.path.join(outdir,'result',sp,'variants',sm),exist_ok=True),"Cannot create %s" % os.path.join(outdir,'result',sp,'variants',sm)
+      for tn in tnPath:
+        assert not os.makedirs(os.path.join(outdir,'result',sp,tn),exist_ok=True),"Cannot create %s" % os.path.join(outdir,'result',sp,tn)
+      spdir = os.path.join(outdir,'result',sp)
+      #curr_path = os.path.dirname(os.path.abspath(__file__))
+
+      if 'A' in args.analy:
+        ubam = pf.FQ2Bam(normalFastq=sampleInfo_dict[sp]['normal'],tumorFastq=sampleInfo_dict[sp]['tumor'],picard=yml_cfg['softwares']['picard'],qcbase=yml_cfg['softwares']['qcbase'],qcwarn1=yml_cfg['softwares']['qcwarn1'],test=args.test,mf=mkflow,outdir=spdir,name=sp)
+
+      if 'B' in args.analy:
+        bwamem = pf.bwa(normalFastq=sampleInfo_dict[sp]['normal'],tumorFastq=sampleInfo_dict[sp]['tumor'],mark='mem',picard=yml_cfg['softwares']['picard'],cores=np,bwa=yml_cfg['softwares']['bwa'],ref=yml_cfg['ref-files']['hg'],mf=mkflow,outdir=spdir,name=sp)
+
+      if 'C' in args.analy:
+        bwaaln = pf.bwa(normalFastq=sampleInfo_dict[sp]['normal'],tumorFastq=sampleInfo_dict[sp]['tumor'],mark='aln',picard=yml_cfg['softwares']['picard'],cores=np,bwa=yml_cfg['softwares']['bwa'],ref=yml_cfg['ref-files']['hg'],mf=mkflow,outdir=spdir,name=sp)
+
+      if 'D' in args.analy:
+        if 'B' in args.analy:
+          merge = pf.MergeBam([ubam[0],ubam[1]],[bwamem[0],bwamem[1]],[ubam[2],ubam[3],bwamem[2],bwamem[3]],picard=yml_cfg['softwares']['picard'],cores=np,ref=yml_cfg['ref-files']['hg'],mf=mkflow,outdir=spdir,name=sp)
+          #merge = pf.MergeBam([ubam[0],ubam[1]],[bwamem[0],bwamem[1]],[ubam[2],ubam[3],bwamem[2],bwamem[3]],picard=yml_cfg['softwares']['picard'],cores=np,ref=yml_cfg['ref-files']['hg'],qcsite=yml_cfg['softwares']['qcsite'],mf=mkflow,outdir=spdir,name=sp)
+        if 'C' in args.analy:
+          merge_aln = pf.MergeBam([ubam[0],ubam[1]],[bwaaln[0],bwaaln[1]],[ubam[2],ubam[3],bwaaln[2],bwaaln[3]],picard=yml_cfg['softwares']['picard'],cores=np,ref=yml_cfg['ref-files']['hg'],mf=mkflow,outdir=spdir,name=sp)
+
+      if 'F' in args.analy:
+        fus=pf.Fusion(merge_aln[0],merge_aln[1],merge_aln[2],merge_aln[3],factera=yml_cfg['softwares']['factera'],compfusion=yml_cfg['softwares']['compfusion'],hg2bit=yml_cfg['ref-files']['hg2bit'],bed=sampleInfo_dict[uName]['panel'],ref=yml_cfg['ref-files']['hg'],bedexon=yml_cfg['ref-files']['bedexon'],mf=mkflow,outdir=spdir,name=sp)
+
+      if '1' in args.analy:
+        Clean = pf.CleanFq(sampleInfo_dict[sp]['normal'],sampleInfo_dict[sp]['tumor'],yml_cfg['softwares']["trimmomatic"],mf=mkflow,outdir=spdir,name=sp)
+
+      if '2' in args.analy:
+        qcFast = pf.FqQualControl(Clean[0],Clean[1],nMark=Clean[2],tMark=Clean[3],mf=mkflow,outdir=spdir,name=sp)
+
+      if '3' in args.analy:
+        bam = pf.bwaMapping(qcFast[0],qcFast[1],qcFast[2],qcFast[3],cores=np,ref=yml_cfg['ref-files']['hg'],bwa=yml_cfg['softwares']['bwa'],mf=mkflow,outdir=spdir,name=sp)
+      elif "b" in args.analy:
+        bam=[os.path.join(spdir,'normal',dir2,'aln.bam'), os.path.join(spdir,'tumor',dir2,'aln.bam'), os.path.join(spdir,'normal',dir2,'done.log'), os.path.join(spdir,'tumor',dir2,'done.log')]
+
+      if '4' in args.analy:
+        sortbam = pf.Sort(bam[0],bam[1],bam[2],bam[3],samtools="samtools",mf=mkflow,outdir=spdir,name=sp)
+
+      if '5' in args.analy:
+        if '4' in args.analy:
+          dedupBam = pf.MarkDuplicates(n_bam=sortbam[0],nMark=sortbam[2],t_bam=sortbam[1],tMark=sortbam[3],picard=yml_cfg['softwares']['picard'],mf=mkflow,outdir=spdir,name=sp)
+        if 'D' in args.analy:
+          if 'B' in args.analy:
+            dedupBam = pf.MarkDuplicates(n_bam=merge[0],nMark=merge[2],t_bam=merge[1],tMark=merge[3],picard=yml_cfg['softwares']['picard'],mf=mkflow,outdir=spdir,name=sp)
+          #if 'C' in args.analy:
+          #  dedupBam_aln = pf.MarkDuplicates(merge_aln[0],merge_aln[1],merge_aln[2],merge_aln[3],picard=yml_cfg['softwares']['picard'],mf=mkflow,outdir=spdir,name=sp)
+      else:
+        dedupBam=[os.path.join(spdir,'normal',dir3,'sortedDedup.bam'), os.path.join(spdir,'tumor',dir3,'sortedDedup.bam'), os.path.join(spdir,'normal',dir3,'dedup_done.log'), os.path.join(spdir,'tumor',dir3,'dedup_done.log')]
+
+      if '6' in args.analy:
+        realignBam = pf.IndelRealigner(dedupBam[0],dedupBam[1],dedupBam[2],dedupBam[3],mf=mkflow,outdir=spdir,name=sp,gatk=yml_cfg['softwares']['gatk'],millsAndIndels=yml_cfg['ref-files']["indels_ref"],dbSNP=yml_cfg['ref-files']["dbsnp"],bedFlank=sampleInfo_dict[uName]['panel'],ref=yml_cfg['ref-files']['hg'])
+
+      if 'J' in args.analy:
+        if '5' in args.analy:
+          qualc=pf.QualControl(sampleInfo_dict[sp]['normal'],sampleInfo_dict[sp]['tumor'],dedupBam[0],dedupBam[1],dedupBam[2],dedupBam[3],qcprog=yml_cfg['softwares']['qcprog'],qcsite=yml_cfg['softwares']['qcsite'],gatk3=yml_cfg['softwares']['gatk3'],ref=yml_cfg['ref-files']['hg'],intvl=yml_cfg['softwares']['qcsite_intvl'],qcwarn2=yml_cfg['softwares']['qcwarn2'],test=args.test,bed=sampleInfo_dict[uName]['panel'],mf=mkflow,outdir=spdir,name=sp)
+        else:
+          qualc=pf.QualControl(sampleInfo_dict[sp]['normal'],sampleInfo_dict[sp]['tumor'],merge[0],merge[1],merge[2],merge[3],qcprog=yml_cfg['softwares']['qcprog'],qcsite=yml_cfg['softwares']['qcsite'],gatk3=yml_cfg['softwares']['gatk3'],ref=yml_cfg['ref-files']['hg'],intvl=yml_cfg['softwares']['qcsite_intvl'],qcwarn2=yml_cfg['softwares']['qcwarn2'],test=args.test,bed=sampleInfo_dict[uName]['panel'],mf=mkflow,outdir=spdir,name=sp)
+        #qualc=pf.QualControl(sampleInfo_dict[sp]['normal'],sampleInfo_dict[sp]['tumor'],bqsrBam[0],bqsrBam[1],bqsrBam[2],bqsrBam[3],qcprog=yml_cfg['softwares']['qcprog'],bed=sampleInfo_dict[uName]['panel'],mf=mkflow,outdir=spdir,name=sp)
+
+      if '7' in args.analy:
+        if '6' in args.analy:
+          bqsrBam = pf.BQSR(n_bam=realignBam[0],nMark=realignBam[2],t_bam=realignBam[1],tMark=realignBam[3],mf=mkflow,name=sp,outdir=spdir,gatk=yml_cfg['softwares']['gatk'],millsAndIndels=yml_cfg['ref-files']['indels_ref'],dbSNP=yml_cfg['ref-files']['dbsnp'],bedFlank=sampleInfo_dict[uName]['panel'],ref=yml_cfg['ref-files']['hg'])
+        if 'D' in args.analy:
+          if 'B' in args.analy:
+            if '5' in args.analy:
+              #bqsrBam = pf.BQSR(n_bam=dedupBam[0],nMark=dedupBam[2],t_bam=dedupBam[1],tMark=dedupBam[3],mf=mkflow,name=sp,outdir=spdir,gatk=yml_cfg['softwares']['gatk4'],qcsite=yml_cfg['softwares']['qcsite'],nqcout=qualc[0],tqcout=qualc[1],qcwarn2=yml_cfg['softwares']['qcwarn2'],millsAndIndels=yml_cfg['ref-files']['indels_ref'],dbSNP=yml_cfg['ref-files']['dbsnp'],bedFlank=sampleInfo_dict[uName]['panel'],ref=yml_cfg['ref-files']['hg'])
+              bqsrBam = pf.BQSR(n_bam=dedupBam[0],nMark=dedupBam[2],t_bam=dedupBam[1],tMark=dedupBam[3],mf=mkflow,name=sp,outdir=spdir,gatk=yml_cfg['softwares']['gatk4'],millsAndIndels=yml_cfg['ref-files']['indels_ref'],dbSNP=yml_cfg['ref-files']['dbsnp'],bedFlank=sampleInfo_dict[uName]['panel'],ref=yml_cfg['ref-files']['hg'])
+            else:
+              bqsrBam = pf.BQSR(n_bam=merge[0],nMark=merge[2],t_bam=merge[1],tMark=merge[3],mf=mkflow,name=sp,outdir=spdir,gatk=yml_cfg['softwares']['gatk4'],millsAndIndels=yml_cfg['ref-files']['indels_ref'],dbSNP=yml_cfg['ref-files']['dbsnp'],bedFlank=sampleInfo_dict[uName]['panel'],ref=yml_cfg['ref-files']['hg'])
+          #if 'C' in args.analy:
+          #  bqsrBam_aln = pf.BQSR(dedupBam_aln[0],dedupBam_aln[1],dedupBam_aln[2],dedupBam_aln[3],mf=mkflow,name=sp,outdir=spdir,gatk=yml_cfg['softwares']['gatk4'],millsAndIndels=yml_cfg['ref-files']["indels_ref"],dbSNP=yml_cfg['ref-files']["dbsnp"],bedFlank=yml_cfg['sample-details']["target"],ref=yml_cfg['ref-files']['hg'])
+
+      if 'E' in args.analy:
+        germ=pf.Germline(bqsrBam[0],bqsrBam[2],t_bam=bqsrBam[1],tMark=bqsrBam[3],mf=mkflow,name=sp,outdir=spdir,gatk=yml_cfg['softwares']['gatk4'],oneKGp3=yml_cfg['ref-files']['oneKGp3'],bed=sampleInfo_dict[uName]['panel'],ref=yml_cfg['ref-files']['hg'])
+
+      if 'G' in args.analy:
+        cnvc=pf.CNV(bqsrBam[0],bqsrBam[1],bqsrBam[2],bqsrBam[3],contra=yml_cfg['softwares']['contra'],filter=yml_cfg['softwares']['filter'],lr=yml_cfg['softwares']['lr'],rd=yml_cfg['softwares']['rd'],bed=sampleInfo_dict[uName]['panel'],sex=sampleInfo_dict[uName]['sex'],mf=mkflow,outdir=spdir,name=sp)
+
+      if 'I' in args.analy:
+        msi=pf.MSI(bqsrBam[0],bqsrBam[1],bqsrBam[2],bqsrBam[3],mantis=yml_cfg['softwares']['mantis'],msibeddir=yml_cfg['ref-files']['msibeddir'],ref=yml_cfg['ref-files']['hg'],mf=mkflow,outdir=spdir,name=sp)
+
+      if '8' in args.analy:
+        if '6' in args.analy:
+          mut2res=[os.path.join(spdir,'variants','somatic',dirs,"raw.vcf"), os.path.join(spdir,'variants','somatic',dirs,"raw.log")]
+          pf.Mutect2(n_bam=bqsrBam[0],t_bam=bqsrBam[1],nMark=bqsrBam[2],tMark=bqsrBam[3],out=mut2res,mf=mkflow,nsplit=args.nsb,name=sp,outdir=spdir,gatk=yml_cfg['softwares']['gatk'],dbSNP=yml_cfg['ref-files']["dbsnp"],bedFlank=sampleInfo_dict[uName]['panel'],ref=yml_cfg['ref-files']['hg'],cosmic=yml_cfg['ref-files']["cosmic"])  # samtools=yml_cfg['softwares']["samtools"]
+        if 'D' in args.analy:
+          mut2res=[os.path.join(spdir,'variants','somatic',dirs,"filteredCon2.split.vcf"), os.path.join(spdir,'variants','somatic',dirs,"FilterOxoG_done.log")]
+          pf.Mutect2(n_bam=bqsrBam[0],t_bam=bqsrBam[1],nMark=bqsrBam[2],tMark=bqsrBam[3],out=mut2res,mf=mkflow,nsplit=args.nsb,name=sp,outdir=spdir,gatk=yml_cfg['softwares']['gatk4'],dbSNP=yml_cfg['ref-files']["gnomAD"],bedFlank=sampleInfo_dict[uName]['panel'],ref=yml_cfg['ref-files']['hg'],exac=yml_cfg['ref-files']['exac'])
+
+      if '9' in args.analy:
+        if '8' in args.analy:
+          ann=pf.Annotate(vcf=mut2res[0],mark=mut2res[1],n_bam=bqsrBam[0],t_bam=bqsrBam[1],xref=yml_cfg['softwares']['annovarXref'],title='Somatic',annovar=yml_cfg['softwares']['annovar'],outdir=spdir,mf=mkflow,name=sp,anndb=yml_cfg['softwares']['annovarDB'],ref=yml_cfg['ref-files']['hg'],vep=yml_cfg['softwares']['vep'],dir=yml_cfg['softwares']['vepcachedir'],fpfilter=yml_cfg['softwares']['fpfilter'],cosmver=args.cosm)
+        if 'E' in args.analy:
+          anng=pf.Annotate(vcf=germ[0],mark=germ[1],n_bam=bqsrBam[0],t_bam=bqsrBam[1],xref=yml_cfg['softwares']['annovarXref'],title='Germline',annovar=yml_cfg['softwares']['annovar'],outdir=spdir,mf=mkflow,name=sp,anndb=yml_cfg['softwares']['annovarDB'],ref=yml_cfg['ref-files']['hg'],vep=yml_cfg['softwares']['vep'],dir=yml_cfg['softwares']['vepcachedir'],fpfilter=yml_cfg['softwares']['fpfilter'],cosmver=args.cosm)
+        #ann=pf.Annotate(mut2res[0],mut2res[1],mut2res[2],mut2res[3],yml_cfg['softwares']['annovarXref'],annovar=yml_cfg['softwares']['annovar'],outdir=spdir,mf=mkflow,name=sp,anndb=yml_cfg['softwares']['annovarDB'])
+        #annpass=pf.Annotate(mut2res[1],mut2res[3],yml_cfg['softwares']['annovarXref'],'Pass',annovar=yml_cfg['softwares']['annovar'],outdir=spdir,mf=mkflow,name=sp,anndb=yml_cfg['softwares']['annovarDB'])
+
+      if 'H' in args.analy:
+        #tmb=pf.TMB(mut2res[0],mut2res[1],tmb=yml_cfg['softwares']['tmb'],mf=mkflow,outdir=spdir,name=sp)
+        tmb=pf.TMB(ann[2],ann[0],tmb=yml_cfg['softwares']['tmb'],mf=mkflow,outdir=spdir,name=sp)
+
+      if 'a' in args.analy:
+        contEstResult=pf.contEst(bqsrBam[0],bqsrBam[1],bqsrBam[2],bqsrBam[3],ref=yml_cfg['ref-files']['hg'],gatk=yml_cfg['softwares']['gatk'],bedFlank=sampleInfo_dict[uName]['panel'],outdir=spdir,mf=mkflow,name=sp,hapmap=yml_cfg['ref-files']['hapmap'])
+
+      if 'b' in args.analy:
+        bam=pf.bwaAlnMap(qcFast[0],qcFast[1],[qcFast[2],qcFast[3]],picard=yml_cfg['softwares']['picard'],cores=np,ref=yml_cfg['ref-files']['hg'],bwa=yml_cfg['softwares']['bwa'],mf=mkflow,outdir=spdir,name=sp)
+
+      if 'c' in args.analy:
+        cnv=pf.callCNV(bqsrBam[0],bqsrBam[1],bqsrBam[2],bqsrBam[3],bed=sampleInfo_dict[uName]['panel'],contra=yml_cfg['softwares']['contra'],outdir=spdir,mf=mkflow,name=sp)
+
+      if 'f' in args.analy:
+        CleanP = pf.CleanP(sampleInfo_dict[sp]['normal'],sampleInfo_dict[sp]['tumor'],yml_cfg['softwares']["fastp"],mf=mkflow,outdir=spdir,name=sp)
+
+      if 'g' in args.analy:
+        dedup=pf.Dedup(sortbam[0],sortbam[1],sortbam[2],sortbam[3],dedup=yml_cfg['softwares']["dedup"],mf=mkflow,outdir=spdir,name=sp)
+
+      if 'h' in args.analy:
+        mpileup=pf.mpileup(dedup[0],dedup[1],dedup[2],dedup[3],yml_cfg['softwares']["samtools"],ref=yml_cfg['ref-files']['hg'],bed=sampleInfo_dict[uName]['panel'],mf=mkflow,outdir=spdir,name=sp)
+
+      if 'i' in args.analy:
+        vs=pf.varscan(mpileup[0],mpileup[1],mpileup[2],mpileup[3],yml_cfg['softwares']["varscan"],mf=mkflow,outdir=spdir,name=sp)
+
+      if 'j' in args.analy:
+        annsn=pf.Annotate(vs[0],vs[4],yml_cfg['softwares']['annovarXref'],'VarscanSNPnormal',annovar=yml_cfg['softwares']['annovar'],outdir=spdir,mf=mkflow,name=sp,anndb=yml_cfg['softwares']['annovarDB'])
+        annst=pf.Annotate(vs[1],vs[5],yml_cfg['softwares']['annovarXref'],'VarscanSNPtumor',annovar=yml_cfg['softwares']['annovar'],outdir=spdir,mf=mkflow,name=sp,anndb=yml_cfg['softwares']['annovarDB'])
+        annin=pf.Annotate(vs[2],vs[6],yml_cfg['softwares']['annovarXref'],'VarscanINDELnormal',annovar=yml_cfg['softwares']['annovar'],outdir=spdir,mf=mkflow,name=sp,anndb=yml_cfg['softwares']['annovarDB'])
+        annit=pf.Annotate(vs[3],vs[7],yml_cfg['softwares']['annovarXref'],'VarscanINDELtumor',annovar=yml_cfg['softwares']['annovar'],outdir=spdir,mf=mkflow,name=sp,anndb=yml_cfg['softwares']['annovarDB'])
+
+      if 'k' in args.analy:
+        mbsn=pf.Mrbam(sortbam[0],sortbam[2],annsn[1],annsn[0],'SNPnormal',mrbamdir=yml_cfg['softwares']['mrbamdir'],filter=yml_cfg['softwares']['op_filter'],mf=mkflow,outdir=spdir,name=sp)
+        mbst=pf.Mrbam(sortbam[1],sortbam[3],annst[1],annst[0],'SNPtumor',mrbamdir=yml_cfg['softwares']['mrbamdir'],filter=yml_cfg['softwares']['op_filter'],mf=mkflow,outdir=spdir,name=sp)
+        mbin=pf.Mrbam(sortbam[0],sortbam[2],annin[1],annin[0],'INDELnormal',mrbamdir=yml_cfg['softwares']['mrbamdir'],filter=yml_cfg['softwares']['op_filter'],mf=mkflow,outdir=spdir,name=sp)
+        mbit=pf.Mrbam(sortbam[1],sortbam[3],annit[1],annit[0],'INDELtumor',mrbamdir=yml_cfg['softwares']['mrbamdir'],filter=yml_cfg['softwares']['op_filter'],mf=mkflow,outdir=spdir,name=sp)
+
+      if 'l' in args.analy:
+        msn=pf.Mutscan(sampleInfo_dict[sp]['normal'],'Normal',mutscan=yml_cfg['softwares']["mutscan"],mf=mkflow,outdir=spdir,name=sp)
+        mst=pf.Mutscan(sampleInfo_dict[sp]['tumor'],'Tumor',mutscan=yml_cfg['softwares']["mutscan"],mf=mkflow,outdir=spdir,name=sp)
+
+      if 'm' in args.analy:
+        gfn=pf.Genefuse(sampleInfo_dict[sp]['normal'],yml_cfg['ref-files']['hg'],yml_cfg['softwares']["genefuseCSV"],'Normal',genefuse=yml_cfg['softwares']["genefuse"],mf=mkflow,outdir=spdir,name=sp)
+        gft=pf.Genefuse(sampleInfo_dict[sp]['tumor'],yml_cfg['ref-files']['hg'],yml_cfg['softwares']["genefuseCSV"],'Tumor',genefuse=yml_cfg['softwares']["genefuse"],mf=mkflow,outdir=spdir,name=sp)
+
+      if 'q' in args.analy:
+        qc = pf.QCrun(sampleInfo_dict[sp]['normal'],sampleInfo_dict[sp]['tumor'],mf=mkflow,outdir=spdir,name=sp)
+
+      if 't' in args.analy:
+        tmbold=pf.TMBold(mut2res[0],mut2res[1],mut2res[2],mut2res[3],yml_cfg['sample-details']["bed82"],yml_cfg['softwares']["bedtools"],bed=sampleInfo_dict[uName]['panel'],outdir=spdir,mf=mkflow,name=sp)
+
+      if 'y' in args.analy:
+        pf.DelBigLess(ann[0],Clean[4],bam[0],bam[1],realignBam[0],realignBam[1],bqsrBam[2],bqsrBam[3],outdir=spdir,mf=mkflow,name=sp)
+        #pf.DelBigLess(ann[0],annpass[0],Clean[0],Clean[1],Clean[4],bam[0],bam[1],dedupBam[0],dedupBam[1],realignBam[0],realignBam[1],bqsrBam[2],bqsrBam[3],outdir=spdir,mf=mkflow,name=sp)
+
+      if 'z' in args.analy:
+        pf.DelBig(ann[0],Clean[0],Clean[1],Clean[4],bam[0],bam[1],sortbam[0],sortbam[1],dedupBam[0],dedupBam[1],realignBam[0],realignBam[1],bqsrBam[2],bqsrBam[3],outdir=spdir,mf=mkflow,name=sp)
+        #pf.DelBig(ann[0],annpass[0],Clean[0],Clean[1],Clean[4],bam[0],bam[1],sortbam[0],sortbam[1],dedupBam[0],dedupBam[1],realignBam[0],realignBam[1],bqsrBam[2],bqsrBam[3],outdir=spdir,mf=mkflow,name=sp)
+
+    mkflow.close()
+  mainsh.close()
+
+
+def verifyDF(df):
+  if isinstance(df,str) and df[0]=='/':
+    if not os.path.exists(df):
+      print("File or folder '%s' NOT exist." % df, file=sys.stderr)
+      sys.exit(1)
+
+
+def is_number(s):
+  try:
+    float(s)
+    return True
+  except ValueError:
+    return False
+
+
+if __name__ == '__main__':
+  main()
